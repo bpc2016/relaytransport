@@ -610,16 +610,19 @@ func (t *RelayTransport) handleStream(s network.Stream) {
 			"type":    "pong",
 			"payload": json.RawMessage(pongBytes),
 		}
+		log.Printf("📤 Sending pong to %s (nonce %s)", remotePeerID[:12], pingData.Nonce)
 		if err := json.NewEncoder(s).Encode(response); err != nil {
 			fmt.Printf("⚠️ Failed to send pong: %v\n", err)
 		}
 		return
+
 	case "pong":
 		var pongData struct{ Nonce string }
 		if err := json.Unmarshal(payload, &pongData); err != nil {
 			fmt.Printf("❌ Failed to parse pong: %v\n", err)
 			return
 		}
+		log.Printf("📥 Received pong from %s (nonce %s)", remotePeerID[:12], pongData.Nonce)
 		t.handlePong(pongData.Nonce)
 		return
 	}
