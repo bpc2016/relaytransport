@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"flag"
 	"fmt"
 	"log"
 	"os"
@@ -10,19 +12,17 @@ import (
 	"time"
 
 	"github.com/libp2p/go-libp2p"
-	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/multiformats/go-multiaddr"
 
-	// Replace with your actual import path after publishing the package
-	relaytransport "github.com/bpc2016/relaytransport"
+	relaytransport "github.com/bpc2016/relaytransport" // adjust
 )
 
 // --------------------------------------------------------------------
-// In-memory peer registry (simple map)
+// In‑memory peer registry
 // --------------------------------------------------------------------
 type memoryRegistry struct {
 	mu    sync.RWMutex
-	peers map[string]string // peerID -> username
+	peers map[string]string
 }
 
 func newMemoryRegistry() *memoryRegistry {
@@ -65,155 +65,90 @@ func (r *memoryRegistry) MergeKnownPeers(peers map[string]string) error {
 }
 
 // --------------------------------------------------------------------
-// Peer runner
+// Main
 // --------------------------------------------------------------------
-type peer struct {
-	host      host.Host
-	transport *relaytransport.RelayTransport
-	username  string
-	registry  *memoryRegistry
-}
+func main() {
+	username := flag.String("name", "", "username (required)")
+	flag.Parse()
 
-func newPeer(ctx context.Context, username string, relayMA multiaddr.Multiaddr) (*peer, error) {
-	// 1. Create libp2p host
+	if *username == "" {
+		log.Fatal("Please provide a username with -name")
+	}
+
+	// Hardcoded relay address (replace with your actual relay)
+	const relayAddrStr = "/ip4/138.197.8.191/tcp/4001/p2p/12D3KooWH3C5p4dyffXmFz9sZ3zevcRY9sGPCfoAzvmvvGKtebJf"
+	relayMA, err := multiaddr.NewMultiaddr(relayAddrStr)
+	if err != nil {
+		log.Fatal("Invalid relay address:", err)
+	}
+
+	// Create libp2p host
 	h, err := libp2p.New(
 		libp2p.ListenAddrStrings("/ip4/0.0.0.0/tcp/0"),
 		libp2p.EnableRelay(),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create host: %w", err)
+		log.Fatal("Failed to create host:", err)
 	}
+	defer h.Close()
 
-	// 2. Create registry and transport
+	// Create registry and transport
 	reg := newMemoryRegistry()
 	transport, err := relaytransport.NewRelayTransport(relaytransport.Config{
 		Host:           h,
 		RelayAddr:      relayMA,
-		Username:       username,
+		Username:       *username,
 		PeerRegistry:   reg,
-		RelayDiscovery: relaytransport.NewDefaultRelayDiscovery(), // uses /bpc/discovery/1.0.0
+		RelayDiscovery: relaytransport.NewDefaultRelayDiscovery(),
 	})
 	if err != nil {
-		h.Close()
-		return nil, fmt.Errorf("failed to create transport: %w", err)
+		log.Fatal("Failed to create transport:", err)
 	}
 
-	// 3. Set message handler (just logs)
+	// Set message handler
 	transport.SetMessageHandler(func(fromPeerID, msgType string, payload []byte) {
-		log.Printf("[%s] Received %s from %s: %s", username, msgType, fromPeerID, string(payload))
+		var msg string
+		if err := json.Unmarshal(payload, &msg); err != nil {
+			log.Printf("[%s] Received %s from %s: (raw) %s", *username, msgType, fromPeerID, string(payload))
+		} else {
+			log.Printf("[%s] Received %s from %s: %s", *username, msgType, fromPeerID, msg)
+		}
 	})
 
-	// 4. Start the transport
-	if err := transport.Start(ctx); err != nil {
-		h.Close()
-		return nil, fmt.Errorf("failed to start transport: %w", err)
-	}
-
-	return &peer{
-		host:      h,
-		transport: transport,
-		username:  username,
-		registry:  reg,
-	}, nil
-}
-
-func (p *peer) close() {
-	p.transport.Stop()
-	p.host.Close()
-}
-
-// --------------------------------------------------------------------
-// Main
-// --------------------------------------------------------------------
-func main() {
-	// Parse command-line arguments
-	if len(os.Args) < 2 {
-		log.Fatalf("Usage: %s <relay_multiaddr> [alice_username] [bob_username]\n", os.Args[0])
-	}
-	relayAddrStr := os.Args[1]
-	aliceUsername := "Alice"
-	bobUsername := "Bob"
-	if len(os.Args) >= 3 {
-		aliceUsername = os.Args[2]
-	}
-	if len(os.Args) >= 4 {
-		bobUsername = os.Args[3]
-	}
-
-	relayMA, err := multiaddr.NewMultiaddr(relayAddrStr)
-	if err != nil {
-		log.Fatalf("Invalid relay address: %v", err)
-	}
-
+	// Start transport
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Create two peers
-	alice, err := newPeer(ctx, aliceUsername, relayMA)
-	if err != nil {
-		log.Fatalf("Failed to create Alice: %v", err)
+	if err := transport.Start(ctx); err != nil {
+		log.Fatal("Failed to start transport:", err)
 	}
-	defer alice.close()
 
-	bob, err := newPeer(ctx, bobUsername, relayMA)
-	if err != nil {
-		log.Fatalf("Failed to create Bob: %v", err)
-	}
-	defer bob.close()
+	log.Printf("%s started. Peer ID: %s", *username, h.ID().String())
 
-	log.Printf("Alice peer ID: %s", alice.host.ID().String())
-	log.Printf("Bob peer ID: %s", bob.host.ID().String())
-
-	// Wait for peers to discover each other (up to 30 seconds)
-	log.Println("Waiting for peers to discover each other...")
-	discovered := make(chan struct{}, 2)
-
-	// Use connection handlers to know when a peer connects
-	alice.transport.OnPeerConnected(func(peerID string) {
-		if peerID == bob.host.ID().String() {
-			log.Printf("Alice: Bob connected!")
-			discovered <- struct{}{}
-		}
-	})
-	bob.transport.OnPeerConnected(func(peerID string) {
-		if peerID == alice.host.ID().String() {
-			log.Printf("Bob: Alice connected!")
-			discovered <- struct{}{}
-		}
-	})
-
-	// Wait for both to connect (or timeout)
-	timeout := time.After(30 * time.Second)
-	connectedCount := 0
-waitLoop:
-	for {
-		select {
-		case <-discovered:
-			connectedCount++
-			if connectedCount == 2 {
-				break waitLoop
+	// After a delay, if this is "alice", send a message to the first connected peer
+	go func() {
+		time.Sleep(10 * time.Second)
+		peers := transport.GetConnectedPeers()
+		for _, p := range peers {
+			if p.ID != h.ID().String() && p.Username != "" {
+				// Send a JSON‑encoded string as payload
+				payload, _ := json.Marshal(fmt.Sprintf("Hello from %s!", *username))
+				log.Printf("%s sending message to %s (%s)", *username, p.Username, p.ID[:12])
+				if err := transport.SendMessage(ctx, p.ID, "greeting", payload); err != nil {
+					log.Printf("Send failed: %v", err)
+				} else {
+					log.Println("Message sent")
+				}
+				break
 			}
-		case <-timeout:
-			log.Fatal("Timed out waiting for peers to connect")
 		}
-	}
+	}()
 
-	// Send a message from Alice to Bob
-	log.Printf("Sending message from %s to %s", aliceUsername, bobUsername)
-	err = alice.transport.SendMessage(ctx, bob.host.ID().String(), "greeting", []byte("Hello Bob!"))
-	if err != nil {
-		log.Printf("Send failed: %v", err)
-	} else {
-		log.Println("Message sent successfully")
-	}
-
-	// Wait a moment for the message to be received (should be almost instant)
-	time.Sleep(2 * time.Second)
-
-	log.Println("Test completed successfully. Press Ctrl+C to exit.")
-	// Wait for interrupt to cleanly shutdown
+	// Wait for interrupt signal
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt)
 	<-sigCh
+
 	log.Println("Shutting down...")
+	transport.Stop()
 }
