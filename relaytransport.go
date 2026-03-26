@@ -607,9 +607,9 @@ func (t *RelayTransport) handleStream(s network.Stream) {
 		// Use background context – the pong is independent of the incoming stream
 		if err := t.SendMessage(context.Background(), remotePeerID, "pong", pongPayload); err != nil {
 			fmt.Printf("⚠️ Failed to send pong: %v\n", err)
-		} else {
+		} /* else {
 			log.Printf("📤 Sent pong to %s (nonce %s)", remotePeerID[:12], pingData.Nonce)
-		}
+		} */
 		return
 
 	case "pong":
@@ -618,7 +618,7 @@ func (t *RelayTransport) handleStream(s network.Stream) {
 			fmt.Printf("❌ Failed to parse pong: %v\n", err)
 			return
 		}
-		log.Printf("📥 Received pong from %s (nonce %s)", remotePeerID[:12], pongData.Nonce)
+		// log.Printf("📥 Received pong from %s (nonce %s)", remotePeerID[:12], pongData.Nonce)
 		t.handlePong(pongData.Nonce)
 		return
 	}
@@ -676,7 +676,7 @@ func (t *RelayTransport) startKeepAlive(peerID string) {
 				nonce := fmt.Sprintf("%d-%d", time.Now().UnixNano(), seq)
 				seq++
 
-				log.Printf("Sending ping to %s (nonce %s)", peerID[:12], nonce)
+				// log.Printf("Sending ping to %s (nonce %s)", peerID[:12], nonce)
 
 				pongCh := make(chan time.Time, 1)
 				t.pingMu.Lock()
