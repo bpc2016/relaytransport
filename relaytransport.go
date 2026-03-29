@@ -53,6 +53,7 @@ type Config struct {
 	Username       string
 	PeerRegistry   PeerRegistry
 	RelayDiscovery RelayDiscovery
+	Verbose        bool // if true, print informational logs
 
 	MessageProtocolID  string
 	IdentifyProtocolID string
@@ -68,6 +69,7 @@ type RelayTransport struct {
 	host     host.Host
 	username string
 	peerID   string
+	verbose  bool // v0.1.3
 
 	relayAddr    multiaddr.Multiaddr
 	relayInfo    *peer.AddrInfo
@@ -169,6 +171,7 @@ func NewRelayTransport(cfg Config) (*RelayTransport, error) {
 		pingTimeout:              cfg.PingTimeout,
 		reservationRenewInterval: cfg.ReservationRenewInterval,
 		discoveryInterval:        cfg.DiscoveryInterval,
+		verbose:                  cfg.Verbose,
 	}
 
 	// Set stream handlers (convert string to protocol.ID)
@@ -184,32 +187,26 @@ func (t *RelayTransport) Start(ctx context.Context) error {
 	if err := t.host.Connect(ctx, *t.relayInfo); err != nil {
 		return fmt.Errorf("connect to relay: %w", err)
 	}
-	fmt.Println("✅ Connected to relay")
+	t.log("%s\n", "✅ Connected to relay")
 
 	// 2. Reserve a slot on the relay
 	resv, err := client.Reserve(ctx, t.host, *t.relayInfo)
 	if err != nil {
 		return fmt.Errorf("relay reservation failed: %w", err)
 	}
-	fmt.Printf("📅 Relay reservation made, expires: %s\n", resv.Expiration.Format("15:04:05"))
+	t.log("📅 Relay reservation made, expires: %s\n", resv.Expiration.Format("15:04:05"))
 	t.setReservationExpiry(resv.Expiration)
-
-	// 3. Get observed address from reservation (the relay's view of our address)
-	if len(resv.Addrs) > 0 {
-		t.observedAddr = resv.Addrs[0]
-		fmt.Printf("📡 OBServed address from relay: %s\n", t.observedAddr)
-	}
 
 	// 4. Add circuit address for self
 	circuitAddr, _ := multiaddr.NewMultiaddr(fmt.Sprintf("%s/p2p-circuit", t.relayAddr.String()))
 	t.host.Peerstore().AddAddr(t.host.ID(), circuitAddr, peerstore.PermanentAddrTTL)
-	fmt.Println("🔌 Added self circuit address")
+	t.log("%s\n", "🔌 Added self circuit address")
 
 	// 5. Register with relay (custom discovery protocol)
 	if err := t.registerWithRelay(ctx); err != nil {
 		fmt.Printf("⚠️ Relay registration failed: %v\n", err)
 	} else {
-		fmt.Println("📝 Relay registration acknowledged")
+		t.log("%s\n", "📝 Relay registration acknowledged")
 		go t.discoverOnce(ctx)
 	}
 
@@ -366,7 +363,7 @@ func (t *RelayTransport) renewReservationLoop(ctx context.Context) {
 			if err != nil {
 				fmt.Printf("⚠️ Reservation renewal failed: %v\n", err)
 			} else {
-				fmt.Printf("📅 Reservation renewed, expires: %s\n", resv.Expiration.Format("15:04:05"))
+				t.log("📅 Reservation renewed, expires: %s\n", resv.Expiration.Format("15:04:05"))
 				t.setReservationExpiry(resv.Expiration)
 			}
 		}
@@ -414,7 +411,7 @@ func (t *RelayTransport) handleDiscoveredPeers(peerIDs []string) {
 		if t.IsPeerConnected(pid.String()) {
 			continue
 		}
-		log.Printf("🔍 Discovered peer via relay: %s\n", pid.String()[:12])
+		t.log("🔍 Discovered peer via relay: %s\n", pid.String()[:12])
 
 		circuitAddrStr := fmt.Sprintf("%s/p2p-circuit/p2p/%s", t.relayAddr.String(), pid.String())
 		circuitAddr, err := multiaddr.NewMultiaddr(circuitAddrStr)
@@ -462,7 +459,7 @@ func (t *RelayTransport) connectAndIdentify(ctx context.Context, pi peer.AddrInf
 		h(pi.ID.String())
 	}
 
-	fmt.Printf("✅ Identified peer %s as %s\n", pi.ID.String()[:12], username)
+	t.log("✅ Identified peer %s as %s\n", pi.ID.String()[:12], username)
 	return nil
 }
 
@@ -520,7 +517,7 @@ func (t *RelayTransport) exchangeIdentification(ctx context.Context, peerID stri
 func (t *RelayTransport) handleIdentifyStream(s network.Stream) {
 	defer s.Close()
 	remotePeerID := s.Conn().RemotePeer().String()
-	fmt.Printf("🔐 Identification request from: %s\n", remotePeerID[:12])
+	t.log("🔐 Identification request from: %s\n", remotePeerID[:12])
 
 	s.SetReadDeadline(time.Now().Add(10 * time.Second))
 	var incomingMsg struct {
@@ -568,7 +565,7 @@ func (t *RelayTransport) handleIdentifyStream(s network.Stream) {
 	}
 	t.startKeepAlive(remotePeerID)
 
-	fmt.Printf("✅ Identified and registered peer: %s (%s)\n", incomingMsg.Username, remotePeerID[:12])
+	t.log("✅ Identified and registered peer: %s (%s)\n", incomingMsg.Username, remotePeerID[:12])
 }
 
 func (t *RelayTransport) handleStream(s network.Stream) {
@@ -605,7 +602,7 @@ func (t *RelayTransport) handleStream(s network.Stream) {
 		if err := t.SendMessage(context.Background(), remotePeerID, "pong", pongPayload); err != nil {
 			fmt.Printf("⚠️ Failed to send pong: %v\n", err)
 		} /* else {
-			log.Printf("📤 Sent pong to %s (nonce %s)", remotePeerID[:12], pingData.Nonce)
+			t.log("📤 Sent pong to %s (nonce %s)", remotePeerID[:12], pingData.Nonce)
 		} */
 		return
 
@@ -615,7 +612,7 @@ func (t *RelayTransport) handleStream(s network.Stream) {
 			fmt.Printf("❌ Failed to parse pong: %v\n", err)
 			return
 		}
-		// log.Printf("📥 Received pong from %s (nonce %s)", remotePeerID[:12], pongData.Nonce)
+		// t.log("📥 Received pong from %s (nonce %s)", remotePeerID[:12], pongData.Nonce)
 		t.handlePong(pongData.Nonce)
 		return
 	}
@@ -667,7 +664,7 @@ func (t *RelayTransport) startKeepAlive(peerID string) {
 				return
 			case <-ticker.C:
 				if !t.IsPeerConnected(peerID) {
-					log.Printf("👋 Peer %s disconnected, stopping ping-pong", peerID[:12])
+					t.log("👋 Peer %s disconnected, stopping ping-pong", peerID[:12])
 					return
 				}
 				nonce := fmt.Sprintf("%d-%d", time.Now().UnixNano(), seq)
@@ -762,8 +759,14 @@ func (t *RelayTransport) renewReservation(ctx context.Context) {
 			t.renewReservation(context.Background())
 		})
 	} else {
-		log.Printf("📅 Reservation renewed, expires: %s", resv.Expiration.Format("15:04:05"))
+		t.log("📅 Reservation renewed, expires: %s", resv.Expiration.Format("15:04:05"))
 		t.setReservationExpiry(resv.Expiration)
+	}
+}
+
+func (t *RelayTransport) log(format string, args ...interface{}) {
+	if t.verbose {
+		log.Printf(format, args...)
 	}
 }
 
