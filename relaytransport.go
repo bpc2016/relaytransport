@@ -224,6 +224,7 @@ func (t *RelayTransport) Stop() error {
 	if err := t.deregisterFromRelay(ctx); err != nil {
 		fmt.Printf("⚠️ Failed to deregister from relay: %v\n", err)
 	}
+	fmt.Printf("%s\n", "👋 Bye!")
 	return t.host.Close()
 }
 
