@@ -186,16 +186,7 @@ func (t *RelayTransport) Start(ctx context.Context) error {
 	}
 	fmt.Println("✅ Connected to relay")
 
-	// 2. Get observed address from the connection
-	for _, conn := range t.host.Network().ConnsToPeer(t.relayInfo.ID) {
-		t.observedAddr = conn.RemoteMultiaddr()
-		break
-	}
-	if t.observedAddr != nil {
-		fmt.Printf("📡 Observed address from relay: %s\n", t.observedAddr)
-	}
-
-	// 3. Reserve a slot on the relay
+	// 2. Reserve a slot on the relay
 	resv, err := client.Reserve(ctx, t.host, *t.relayInfo)
 	if err != nil {
 		return fmt.Errorf("relay reservation failed: %w", err)
@@ -203,12 +194,18 @@ func (t *RelayTransport) Start(ctx context.Context) error {
 	fmt.Printf("📅 Relay reservation made, expires: %s\n", resv.Expiration.Format("15:04:05"))
 	t.setReservationExpiry(resv.Expiration)
 
+	// 3. Get observed address from reservation (the relay's view of our address)
+	if len(resv.Addrs) > 0 {
+		t.observedAddr = resv.Addrs[0]
+		fmt.Printf("📡 Observed address from relay: %s\n", t.observedAddr)
+	}
+
 	// 4. Add circuit address for self
 	circuitAddr, _ := multiaddr.NewMultiaddr(fmt.Sprintf("%s/p2p-circuit", t.relayAddr.String()))
 	t.host.Peerstore().AddAddr(t.host.ID(), circuitAddr, peerstore.PermanentAddrTTL)
 	fmt.Println("🔌 Added self circuit address")
 
-	// 5. Register with relay
+	// 5. Register with relay (custom discovery protocol)
 	if err := t.registerWithRelay(ctx); err != nil {
 		fmt.Printf("⚠️ Relay registration failed: %v\n", err)
 	} else {
