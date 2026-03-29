@@ -197,7 +197,7 @@ func (t *RelayTransport) Start(ctx context.Context) error {
 	// 3. Get observed address from reservation (the relay's view of our address)
 	if len(resv.Addrs) > 0 {
 		t.observedAddr = resv.Addrs[0]
-		fmt.Printf("📡 Observed address from relay: %s\n", t.observedAddr)
+		fmt.Printf("📡 OBServed address from relay: %s\n", t.observedAddr)
 	}
 
 	// 4. Add circuit address for self
