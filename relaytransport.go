@@ -53,7 +53,9 @@ type Config struct {
 	Username       string
 	PeerRegistry   PeerRegistry
 	RelayDiscovery RelayDiscovery
-	Verbose        bool // if true, print informational logs
+	IsServer       bool   // v0.1.5
+	Group          string // v0.1.5
+	Verbose        bool   // if true, print informational logs
 
 	MessageProtocolID  string
 	IdentifyProtocolID string
@@ -66,11 +68,12 @@ type Config struct {
 
 // RelayTransport is a libp2p transport that uses a relay for peer discovery.
 type RelayTransport struct {
-	host     host.Host
-	username string
-	peerID   string
-	verbose  bool // v0.1.3
-
+	host         host.Host
+	username     string
+	peerID       string
+	verbose      bool   // v0.1.3
+	isServer     bool   // v0.1.5
+	group        string // v0.1.5
 	relayAddr    multiaddr.Multiaddr
 	relayInfo    *peer.AddrInfo
 	observedAddr multiaddr.Multiaddr
@@ -172,6 +175,8 @@ func NewRelayTransport(cfg Config) (*RelayTransport, error) {
 		reservationRenewInterval: cfg.ReservationRenewInterval,
 		discoveryInterval:        cfg.DiscoveryInterval,
 		verbose:                  cfg.Verbose,
+		isServer:                 cfg.IsServer,
+		group:                    cfg.Group,
 	}
 
 	// Set stream handlers (convert string to protocol.ID)
@@ -481,9 +486,13 @@ func (t *RelayTransport) exchangeIdentification(ctx context.Context, peerID stri
 		Username   string            `json:"username"`
 		PeerID     string            `json:"peer_id"`
 		KnownPeers map[string]string `json:"known_peers"`
+		Group      string            `json:"group"`
+		IsServer   bool              `json:"is_server"`
 	}{
 		Username:   t.username,
 		PeerID:     t.peerID,
+		IsServer:   t.isServer,
+		Group:      t.group,
 		KnownPeers: t.peerRegistry.GetKnownPeers(),
 	}
 	if err := json.NewEncoder(s).Encode(req); err != nil {
@@ -495,6 +504,8 @@ func (t *RelayTransport) exchangeIdentification(ctx context.Context, peerID stri
 	var resp struct {
 		Username   string            `json:"username"`
 		PeerID     string            `json:"peer_id"`
+		Group      string            `json:"group"`
+		IsServer   bool              `json:"is_server"`
 		KnownPeers map[string]string `json:"known_peers"`
 	}
 	if err := json.NewDecoder(s).Decode(&resp); err != nil {
@@ -508,7 +519,14 @@ func (t *RelayTransport) exchangeIdentification(ctx context.Context, peerID stri
 	if resp.Username == "" {
 		return "", fmt.Errorf("received empty username")
 	}
-
+	// If local group is non‑empty and doesn't match remote group, reject
+	if t.group != "" && resp.Group != t.group {
+		return "", fmt.Errorf("group mismatch: expected %s, got %s", t.group, resp.Group)
+	}
+	// Reject client‑client connections
+	if !t.isServer && !resp.IsServer {
+		return "", fmt.Errorf("client-client connection not allowed")
+	}
 	if err := t.peerRegistry.MergeKnownPeers(resp.KnownPeers); err != nil {
 		log.Printf("⚠️ Failed to merge known peers: %v", err)
 	}
@@ -524,6 +542,8 @@ func (t *RelayTransport) handleIdentifyStream(s network.Stream) {
 	var incomingMsg struct {
 		Username   string            `json:"username"`
 		PeerID     string            `json:"peer_id"`
+		Group      string            `json:"group"`
+		IsServer   bool              `json:"is_server"`
 		KnownPeers map[string]string `json:"known_peers"`
 	}
 	decoder := json.NewDecoder(s)
@@ -541,7 +561,16 @@ func (t *RelayTransport) handleIdentifyStream(s network.Stream) {
 		fmt.Printf("⚠️ Empty username from %s\n", remotePeerID[:12])
 		return
 	}
-
+	// If local group is non‑empty and doesn't match remote group, reject
+	if t.group != "" && incomingMsg.Group != t.group {
+		fmt.Printf("❌ Group mismatch from %s: expected %s, got %s\n", remotePeerID[:12], t.group, incomingMsg.Group)
+		return
+	}
+	// Reject client‑client connections
+	if !t.isServer && !incomingMsg.IsServer {
+		fmt.Printf("❌ Rejecting client-client connection from %s\n", remotePeerID[:12])
+		return
+	}
 	if err := t.peerRegistry.MergeKnownPeers(incomingMsg.KnownPeers); err != nil {
 		log.Printf("⚠️ Failed to merge known peers: %v", err)
 	}
@@ -549,10 +578,14 @@ func (t *RelayTransport) handleIdentifyStream(s network.Stream) {
 	response := struct {
 		Username   string            `json:"username"`
 		PeerID     string            `json:"peer_id"`
+		Group      string            `json:"group"`
+		IsServer   bool              `json:"is_server"`
 		KnownPeers map[string]string `json:"known_peers"`
 	}{
 		Username:   t.username,
 		PeerID:     t.peerID,
+		Group:      t.group,
+		IsServer:   t.isServer,
 		KnownPeers: t.peerRegistry.GetKnownPeers(),
 	}
 	if err := json.NewEncoder(s).Encode(response); err != nil {
