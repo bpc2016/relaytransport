@@ -472,7 +472,7 @@ func (t *RelayTransport) handleDiscoveredPeers(peerIDs []string) {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 			if err := t.connectAndIdentify(ctx, pi); err != nil {
-				fmt.Printf("⚠️ Failed to connect to %s: %v\n", pi.ID.String()[:12], err)
+				t.log("⚠️ Failed to connect to %s: %v\n", pi.ID.String()[:12], err)
 			}
 		}(pi)
 	}
