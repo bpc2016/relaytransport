@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -64,6 +65,7 @@ type Config struct {
 	PingTimeout              time.Duration
 	ReservationRenewInterval time.Duration
 	DiscoveryInterval        time.Duration
+	BlacklistDuration        time.Duration // v0.1.8
 }
 
 // RelayTransport is a libp2p transport that uses a relay for peer discovery.
@@ -109,6 +111,11 @@ type RelayTransport struct {
 	pingTimeout              time.Duration
 	reservationRenewInterval time.Duration
 	discoveryInterval        time.Duration
+	blacklistInterval        time.Duration
+
+	// Blacklist
+	blacklist   map[string]time.Time // peerID -> expire time
+	blacklistMu sync.Mutex
 }
 
 type pendingPing struct {
@@ -180,6 +187,8 @@ func NewRelayTransport(cfg Config) (*RelayTransport, error) {
 		verbose:                  cfg.Verbose,
 		isServer:                 cfg.IsServer,
 		group:                    cfg.Group,
+		blacklist:                make(map[string]time.Time),
+		blacklistInterval:        cfg.BlacklistDuration,
 	}
 
 	// Set stream handlers (convert string to protocol.ID)
@@ -411,7 +420,6 @@ func (t *RelayTransport) handleDiscoveredPeers(peerIDs []string) {
 	for _, pidStr := range peerIDs {
 		pid, err := peer.Decode(pidStr)
 		if err != nil {
-			log.Printf("⚠️ Invalid peer ID in discovery list: %s", pidStr)
 			continue
 		}
 		if pid == t.host.ID() {
@@ -420,6 +428,18 @@ func (t *RelayTransport) handleDiscoveredPeers(peerIDs []string) {
 		if t.IsPeerConnected(pid.String()) {
 			continue
 		}
+
+		// Skip blacklisted peers
+		t.blacklistMu.Lock()
+		expire, ok := t.blacklist[pid.String()]
+		if ok && time.Now().Before(expire) {
+			t.blacklistMu.Unlock()
+			continue
+		} else if ok {
+			delete(t.blacklist, pid.String())
+		}
+		t.blacklistMu.Unlock()
+
 		t.log("🔍 Discovered peer via relay: %s\n", pid.String()[:12])
 
 		circuitAddrStr := fmt.Sprintf("%s/p2p-circuit/p2p/%s", t.relayAddr.String(), pid.String())
@@ -445,6 +465,13 @@ func (t *RelayTransport) handleDiscoveredPeers(peerIDs []string) {
 
 func (t *RelayTransport) connectAndIdentify(ctx context.Context, pi peer.AddrInfo) error {
 	if err := t.host.Connect(ctx, pi); err != nil {
+		// Check for NO_RESERVATION error (string match)
+		if strings.Contains(err.Error(), "NO_RESERVATION") {
+			t.blacklistMu.Lock()
+			t.blacklist[pi.ID.String()] = time.Now().Add(t.blacklistInterval)
+			t.blacklistMu.Unlock()
+			t.log("⚠️ Blacklisting %s due to NO_RESERVATION", pi.ID.String()[:12])
+		}
 		return fmt.Errorf("connect failed: %w", err)
 	}
 	username, err := t.exchangeIdentification(ctx, pi.ID.String())
@@ -524,6 +551,9 @@ func (t *RelayTransport) exchangeIdentification(ctx context.Context, peerID stri
 	}
 	// If local group is non‑empty and doesn't match remote group, reject
 	if t.group != "" && resp.Group != t.group {
+		t.blacklistMu.Lock()
+		t.blacklist[peerID] = time.Now().Add(5 * time.Minute)
+		t.blacklistMu.Unlock()
 		return "", fmt.Errorf("group mismatch: expected %s, got %s", t.group, resp.Group)
 	}
 	// Reject client‑client connections
@@ -576,6 +606,9 @@ func (t *RelayTransport) handleIdentifyStream(s network.Stream) {
 	}
 	// If local group is non‑empty and doesn't match remote group, reject
 	if t.group != "" && incomingMsg.Group != t.group {
+		t.blacklistMu.Lock()
+		t.blacklist[remotePeerID] = time.Now().Add(5 * time.Minute)
+		t.blacklistMu.Unlock()
 		fmt.Printf("❌ Group mismatch from %s: expected %s, got %s\n", remotePeerID[:12], t.group, incomingMsg.Group)
 		return
 	}
