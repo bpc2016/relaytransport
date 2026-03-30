@@ -158,6 +158,9 @@ func NewRelayTransport(cfg Config) (*RelayTransport, error) {
 	if cfg.DiscoveryInterval <= 0 {
 		cfg.DiscoveryInterval = 30 * time.Second
 	}
+	if cfg.BlacklistDuration <= 0 {
+		cfg.BlacklistDuration = 5 * time.Minute
+	}
 
 	relayInfo, err := peer.AddrInfoFromP2pAddr(cfg.RelayAddr)
 	if err != nil {
