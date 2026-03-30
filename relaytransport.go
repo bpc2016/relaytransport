@@ -553,8 +553,19 @@ func (t *RelayTransport) exchangeIdentification(ctx context.Context, peerID stri
 		KnownPeers map[string]string `json:"known_peers"`
 	}
 	if err := json.NewDecoder(s).Decode(&resp); err != nil {
+		if err == io.EOF {
+			t.blacklistMu.Lock()
+			t.blacklist[peerID] = time.Now().Add(t.blacklistInterval)
+			t.blacklistMu.Unlock()
+			t.log("⚠️ Blacklisting %s due to EOF (likely group mismatch)", peerID[:12])
+		}
 		return "", fmt.Errorf("receive identify: %w", err)
 	}
+	/*
+		if err := json.NewDecoder(s).Decode(&resp); err != nil {
+			return "", fmt.Errorf("receive identify: %w", err)
+		}
+	*/
 	s.SetReadDeadline(time.Time{})
 
 	if resp.PeerID != peerID {
