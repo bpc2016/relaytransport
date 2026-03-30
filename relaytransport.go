@@ -115,6 +115,9 @@ type pendingPing struct {
 	ch    chan time.Time
 	timer *time.Timer
 }
+type PeerRoleSetter interface {
+	SetPeerRole(peerID string, isServer bool)
+}
 
 // NewRelayTransport creates a new RelayTransport with the given configuration.
 func NewRelayTransport(cfg Config) (*RelayTransport, error) {
@@ -527,9 +530,19 @@ func (t *RelayTransport) exchangeIdentification(ctx context.Context, peerID stri
 	if !t.isServer && !resp.IsServer {
 		return "", fmt.Errorf("client-client connection not allowed")
 	}
+
+	// Register the peer
+	remoteAddr := s.Conn().RemoteMultiaddr().String()
+	if err := t.peerRegistry.RegisterPeer(peerID, resp.Username, remoteAddr); err != nil {
+		log.Printf("⚠️ Failed to register peer %s: %v", peerID[:12], err)
+	}
+	if setter, ok := t.peerRegistry.(PeerRoleSetter); ok {
+		setter.SetPeerRole(peerID, resp.IsServer)
+	}
 	if err := t.peerRegistry.MergeKnownPeers(resp.KnownPeers); err != nil {
 		log.Printf("⚠️ Failed to merge known peers: %v", err)
 	}
+
 	return resp.Username, nil
 }
 
@@ -593,10 +606,17 @@ func (t *RelayTransport) handleIdentifyStream(s network.Stream) {
 		return
 	}
 
+	// Store in peer manager
 	address := s.Conn().RemoteMultiaddr().String()
 	if err := t.peerRegistry.RegisterPeer(remotePeerID, incomingMsg.Username, address); err != nil {
 		log.Printf("⚠️ Failed to register peer %s: %v", remotePeerID[:12], err)
 	}
+
+	// If the registry supports role storage, store the IsServer flag
+	if setter, ok := t.peerRegistry.(PeerRoleSetter); ok {
+		setter.SetPeerRole(remotePeerID, incomingMsg.IsServer)
+	}
+
 	t.startKeepAlive(remotePeerID)
 
 	t.log("✅ Identified and registered peer: %s (%s)\n", incomingMsg.Username, remotePeerID[:12])
