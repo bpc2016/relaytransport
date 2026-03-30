@@ -433,16 +433,6 @@ func (t *RelayTransport) handleDiscoveredPeers(peerIDs []string) {
 		}
 
 		// Skip blacklisted peers
-		/*
-			t.blacklistMu.Lock()
-			expire, ok := t.blacklist[pid.String()]
-			if ok && time.Now().Before(expire) {
-				t.blacklistMu.Unlock()
-				continue
-			} else if ok {
-				delete(t.blacklist, pid.String())
-			}
-			t.blacklistMu.Unlock() */
 		t.blacklistMu.Lock()
 		expire, ok := t.blacklist[pid.String()]
 		if ok && time.Now().Before(expire) {
@@ -561,11 +551,7 @@ func (t *RelayTransport) exchangeIdentification(ctx context.Context, peerID stri
 		}
 		return "", fmt.Errorf("receive identify: %w", err)
 	}
-	/*
-		if err := json.NewDecoder(s).Decode(&resp); err != nil {
-			return "", fmt.Errorf("receive identify: %w", err)
-		}
-	*/
+
 	s.SetReadDeadline(time.Time{})
 
 	if resp.PeerID != peerID {
@@ -576,10 +562,6 @@ func (t *RelayTransport) exchangeIdentification(ctx context.Context, peerID stri
 	}
 	// If local group is non‑empty and doesn't match remote group, reject
 	if t.group != "" && resp.Group != t.group {
-		/*
-			t.blacklistMu.Lock()
-			t.blacklist[peerID] = time.Now().Add(t.blacklistInterval)
-			t.blacklistMu.Unlock() */
 		t.blacklistMu.Lock()
 		t.blacklist[peerID] = time.Now().Add(t.blacklistInterval)
 		t.blacklistMu.Unlock()
@@ -636,12 +618,6 @@ func (t *RelayTransport) handleIdentifyStream(s network.Stream) {
 	}
 	// If local group is non‑empty and doesn't match remote group, reject
 	if t.group != "" && incomingMsg.Group != t.group {
-		/*
-			t.blacklistMu.Lock()
-			t.blacklist[remotePeerID] = time.Now().Add(t.blacklistInterval)
-			t.blacklistMu.Unlock()
-			fmt.Printf("❌ Group mismatch from %s: expected %s, got %s\n", remotePeerID[:12], t.group, incomingMsg.Group)
-		*/
 		t.blacklistMu.Lock()
 		t.blacklist[remotePeerID] = time.Now().Add(t.blacklistInterval)
 		t.blacklistMu.Unlock()
