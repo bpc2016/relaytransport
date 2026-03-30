@@ -433,16 +433,27 @@ func (t *RelayTransport) handleDiscoveredPeers(peerIDs []string) {
 		}
 
 		// Skip blacklisted peers
+		/*
+			t.blacklistMu.Lock()
+			expire, ok := t.blacklist[pid.String()]
+			if ok && time.Now().Before(expire) {
+				t.blacklistMu.Unlock()
+				continue
+			} else if ok {
+				delete(t.blacklist, pid.String())
+			}
+			t.blacklistMu.Unlock() */
 		t.blacklistMu.Lock()
 		expire, ok := t.blacklist[pid.String()]
 		if ok && time.Now().Before(expire) {
 			t.blacklistMu.Unlock()
+			t.log("🔇 Skipping blacklisted peer %s until %v", pid.String()[:12], expire)
 			continue
 		} else if ok {
 			delete(t.blacklist, pid.String())
+			t.log("🗑️ Removed expired blacklist entry for %s", pid.String()[:12])
 		}
 		t.blacklistMu.Unlock()
-
 		t.log("🔍 Discovered peer via relay: %s\n", pid.String()[:12])
 
 		circuitAddrStr := fmt.Sprintf("%s/p2p-circuit/p2p/%s", t.relayAddr.String(), pid.String())
@@ -554,9 +565,14 @@ func (t *RelayTransport) exchangeIdentification(ctx context.Context, peerID stri
 	}
 	// If local group is non‑empty and doesn't match remote group, reject
 	if t.group != "" && resp.Group != t.group {
+		/*
+			t.blacklistMu.Lock()
+			t.blacklist[peerID] = time.Now().Add(t.blacklistInterval)
+			t.blacklistMu.Unlock() */
 		t.blacklistMu.Lock()
-		t.blacklist[peerID] = time.Now().Add(5 * time.Minute)
+		t.blacklist[peerID] = time.Now().Add(t.blacklistInterval)
 		t.blacklistMu.Unlock()
+		t.log("⚠️ Blacklisting %s due to group mismatch (expires %v)", peerID[:12], time.Now().Add(t.blacklistInterval))
 		return "", fmt.Errorf("group mismatch: expected %s, got %s", t.group, resp.Group)
 	}
 	// Reject client‑client connections
@@ -609,10 +625,16 @@ func (t *RelayTransport) handleIdentifyStream(s network.Stream) {
 	}
 	// If local group is non‑empty and doesn't match remote group, reject
 	if t.group != "" && incomingMsg.Group != t.group {
+		/*
+			t.blacklistMu.Lock()
+			t.blacklist[remotePeerID] = time.Now().Add(t.blacklistInterval)
+			t.blacklistMu.Unlock()
+			fmt.Printf("❌ Group mismatch from %s: expected %s, got %s\n", remotePeerID[:12], t.group, incomingMsg.Group)
+		*/
 		t.blacklistMu.Lock()
-		t.blacklist[remotePeerID] = time.Now().Add(5 * time.Minute)
+		t.blacklist[remotePeerID] = time.Now().Add(t.blacklistInterval)
 		t.blacklistMu.Unlock()
-		fmt.Printf("❌ Group mismatch from %s: expected %s, got %s\n", remotePeerID[:12], t.group, incomingMsg.Group)
+		t.log("⚠️ Blacklisting %s due to group mismatch (expires %v)", remotePeerID[:12], time.Now().Add(t.blacklistInterval))
 		return
 	}
 	// Reject client‑client connections
