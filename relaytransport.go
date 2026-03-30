@@ -116,6 +116,7 @@ type RelayTransport struct {
 	// Blacklist
 	blacklist   map[string]time.Time // peerID -> expire time
 	blacklistMu sync.Mutex
+	cancelFunc  context.CancelFunc // see Start()
 }
 
 type pendingPing struct {
@@ -203,6 +204,8 @@ func NewRelayTransport(cfg Config) (*RelayTransport, error) {
 
 // Start connects to the relay, reserves a slot, and starts background tasks.
 func (t *RelayTransport) Start(ctx context.Context) error {
+	ctx, cancel := context.WithCancel(ctx)
+	t.cancelFunc = cancel
 	// 1. Connect to relay
 	if err := t.host.Connect(ctx, *t.relayInfo); err != nil {
 		return fmt.Errorf("connect to relay: %w", err)
@@ -239,6 +242,10 @@ func (t *RelayTransport) Start(ctx context.Context) error {
 
 // Stop deregisters from the relay and closes the host.
 func (t *RelayTransport) Stop() error {
+	if t.cancelFunc != nil {
+		t.cancelFunc() // this stops discoverPeersLoop, renewReservationLoop, etc.
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := t.deregisterFromRelay(ctx); err != nil {
