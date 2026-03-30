@@ -673,6 +673,15 @@ func (t *RelayTransport) handleIdentifyStream(s network.Stream) {
 		setter.SetPeerRole(remotePeerID, incomingMsg.IsServer)
 	}
 
+	// symmetrical recognition
+	// Call peer connected handlers (symmetrical to client side)
+	t.mu.RLock()
+	handlers := t.peerConnectedHandlers
+	t.mu.RUnlock()
+	for _, h := range handlers {
+		h(remotePeerID)
+	}
+
 	t.startKeepAlive(remotePeerID)
 
 	t.log("✅ Identified and registered peer: %s (%s)\n", incomingMsg.Username, remotePeerID[:12])
