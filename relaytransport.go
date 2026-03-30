@@ -409,6 +409,10 @@ func (t *RelayTransport) discoverPeersLoop(ctx context.Context) {
 		case <-ticker.C:
 			peerIDs, err := t.requestPeerList(ctx)
 			if err != nil {
+				// Don't log if the context is cancelled (shutting down)
+				if ctx.Err() != nil {
+					return
+				}
 				fmt.Printf("⚠️ Relay discovery error: %v\n", err)
 				continue
 			}
