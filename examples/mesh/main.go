@@ -97,6 +97,6 @@ func main() {
 	}
 	defer transport.Stop()
 
-	log.Printf("%s ready", *name)
+	log.Printf("%s is ready!", *name)
 	<-ctx.Done()
 }

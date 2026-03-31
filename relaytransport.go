@@ -873,7 +873,7 @@ func (t *RelayTransport) setReservationExpiry(expiry time.Time) {
 }
 
 func (t *RelayTransport) renewReservation(ctx context.Context) {
-	log.Println("Attempting to renew relay reservation...")
+	log.Println("Attempting to renew the relay reservation...")
 	resv, err := client.Reserve(ctx, t.host, *t.relayInfo)
 	if err != nil {
 		log.Printf("❌ Reservation renewal failed: %v", err)
