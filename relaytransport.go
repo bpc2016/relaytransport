@@ -732,7 +732,7 @@ func (t *RelayTransport) handleStream(s network.Stream) {
 			return
 		}
 		t.log("📥 Received pong from %s (nonce %s)", remotePeerID[:12], pongData.Nonce)
-		t.handlePong(pongData.Nonce)
+		t.HandlePong(pongData.Nonce)
 		return
 	}
 
@@ -829,7 +829,7 @@ func (t *RelayTransport) startKeepAlive(peerID string) {
 	}()
 }
 
-func (t *RelayTransport) handlePong(nonce string) {
+func (t *RelayTransport) HandlePong(nonce string) {
 	t.pingMu.Lock()
 	defer t.pingMu.Unlock()
 	if pp, ok := t.pendingPings[nonce]; ok {
