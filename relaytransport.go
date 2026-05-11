@@ -63,6 +63,7 @@ type Config struct {
 
 	KeepAliveInterval        time.Duration
 	PingTimeout              time.Duration
+	PingReceiveTimeout       time.Duration // if non‑sender, disconnect when silent for this long
 	ReservationRenewInterval time.Duration
 	DiscoveryInterval        time.Duration
 	BlacklistDuration        time.Duration // v0.1.8
@@ -96,10 +97,13 @@ type RelayTransport struct {
 	mu                       sync.RWMutex
 
 	// Keep-alive / ping-pong
-	keepAliveCancel map[string]context.CancelFunc
-	kaMu            sync.Mutex
-	pendingPings    map[string]*pendingPing
-	pingMu          sync.Mutex
+	keepAliveCancel    map[string]context.CancelFunc
+	kaMu               sync.Mutex
+	pendingPings       map[string]*pendingPing
+	pingMu             sync.Mutex
+	lastPingReceived   map[string]time.Time
+	lastPingReceivedMu sync.Mutex
+	pingReceiveTimeout time.Duration
 
 	// Reservation
 	reservationExpiry time.Time
@@ -157,6 +161,9 @@ func NewRelayTransport(cfg Config) (*RelayTransport, error) {
 	if cfg.PingTimeout <= 0 {
 		cfg.PingTimeout = 5 * time.Second
 	}
+	if cfg.PingReceiveTimeout <= 0 {
+		cfg.PingReceiveTimeout = 30 * time.Second
+	}
 	if cfg.ReservationRenewInterval <= 0 {
 		cfg.ReservationRenewInterval = 55 * time.Minute
 	}
@@ -202,6 +209,8 @@ func NewRelayTransport(cfg Config) (*RelayTransport, error) {
 	// Set stream handlers (convert string to protocol.ID)
 	t.host.SetStreamHandler(protocol.ID(t.identifyProtocolID), t.handleIdentifyStream)
 	t.host.SetStreamHandler(protocol.ID(t.messageProtocolID), t.handleStream)
+	t.pingReceiveTimeout = cfg.PingReceiveTimeout
+	t.lastPingReceived = make(map[string]time.Time)
 
 	// init disconnect channel
 	t.disconnected = make(chan struct{})
@@ -742,6 +751,9 @@ func (t *RelayTransport) handleStream(s network.Stream) {
 			fmt.Printf("❌ Failed to parse ping: %v\n", err)
 			return
 		}
+		t.lastPingReceivedMu.Lock()
+		t.lastPingReceived[remotePeerID] = time.Now()
+		t.lastPingReceivedMu.Unlock()
 		// Send pong as a new message (not on the same stream)
 		pongPayload, _ := json.Marshal(map[string]string{"nonce": pingData.Nonce})
 		// Use background context – the pong is independent of the incoming stream
@@ -780,80 +792,99 @@ func (t *RelayTransport) shouldSendKeepAlive(remotePeerID string) bool {
 }
 
 func (t *RelayTransport) startKeepAlive(peerID string) {
-	if !t.shouldSendKeepAlive(peerID) {
-		return
-	}
 	t.kaMu.Lock()
-	defer t.kaMu.Unlock()
 	if cancel, exists := t.keepAliveCancel[peerID]; exists {
 		cancel()
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	t.keepAliveCancel[peerID] = cancel
 
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				log.Printf("🔥 Ping-pong goroutine for %s panicked: %v (restarting)", peerID[:12], r)
-				time.Sleep(5 * time.Second)
-				t.startKeepAlive(peerID)
+	if t.shouldSendKeepAlive(peerID) {
+		// Sender: send pings regularly
+		ctx, cancel := context.WithCancel(context.Background())
+		t.keepAliveCancel[peerID] = cancel
+		t.kaMu.Unlock()
+
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("🔥 Ping-pong goroutine for %s panicked: %v (restarting)", peerID[:12], r)
+					time.Sleep(5 * time.Second)
+					t.startKeepAlive(peerID)
+				}
+			}()
+
+			ticker := time.NewTicker(t.keepAliveInterval)
+			defer ticker.Stop()
+			var seq int64 = 0
+			for {
+				select {
+				case <-ctx.Done():
+					log.Printf("🛑 Ping-pong stopped for %s", peerID[:12])
+					return
+				case <-ticker.C:
+					if !t.IsPeerConnected(peerID) {
+						t.log("👋 Peer %s disconnected, stopping ping-pong", peerID[:12])
+						t.mu.RLock()
+						for _, h := range t.peerDisconnectedHandlers {
+							h(peerID)
+						}
+						t.mu.RUnlock()
+						return
+					}
+					nonce := fmt.Sprintf("%d-%d", time.Now().UnixNano(), seq)
+					seq++
+
+					if t.verbose {
+						log.Printf("📤 Sending ping to %s (nonce %s)", peerID[:12], nonce)
+					}
+
+					pongCh := make(chan time.Time, 1)
+					t.pingMu.Lock()
+					timer := time.AfterFunc(t.pingTimeout, func() {
+						t.pingMu.Lock()
+						delete(t.pendingPings, nonce)
+						t.pingMu.Unlock()
+						log.Printf("⚠️ Ping timeout for %s (nonce %s)", peerID[:12], nonce)
+
+						// Force disconnect and notify application
+						t.DisconnectFromPeer(peerID)
+						t.mu.RLock()
+						for _, h := range t.peerDisconnectedHandlers {
+							h(peerID)
+						}
+						t.mu.RUnlock()
+					})
+					t.pendingPings[nonce] = &pendingPing{ch: pongCh, timer: timer}
+					t.pingMu.Unlock()
+
+					payload, _ := json.Marshal(map[string]string{"nonce": nonce})
+					err := t.SendMessage(ctx, peerID, "ping", payload)
+					if err != nil {
+						log.Printf("⚠️ Ping to %s failed: %v", peerID[:12], err)
+						t.pingMu.Lock()
+						if pp, ok := t.pendingPings[nonce]; ok {
+							pp.timer.Stop()
+							delete(t.pendingPings, nonce)
+						}
+						t.pingMu.Unlock()
+						continue
+					}
+
+					select {
+					case <-pongCh:
+						// success
+					case <-time.After(t.pingTimeout):
+						// already handled by timer
+					}
+				}
 			}
 		}()
-
-		ticker := time.NewTicker(t.keepAliveInterval)
-		defer ticker.Stop()
-		var seq int64 = 0
-		for {
-			select {
-			case <-ctx.Done():
-				log.Printf("🛑 Ping-pong stopped for %s", peerID[:12])
-				return
-			case <-ticker.C:
-				if !t.IsPeerConnected(peerID) {
-					t.log("👋 Peer %s disconnected, stopping ping-pong", peerID[:12])
-					return
-				}
-				nonce := fmt.Sprintf("%d-%d", time.Now().UnixNano(), seq)
-				seq++
-
-				// log.Printf("Sending ping to %s (nonce %s)", peerID[:12], nonce)
-				if t.verbose {
-					log.Printf("📤 Sending ping to %s (nonce %s)", peerID[:12], nonce)
-				}
-
-				pongCh := make(chan time.Time, 1)
-				t.pingMu.Lock()
-				timer := time.AfterFunc(t.pingTimeout, func() {
-					t.pingMu.Lock()
-					delete(t.pendingPings, nonce)
-					t.pingMu.Unlock()
-					log.Printf("⚠️ Ping timeout for %s (nonce %s)", peerID[:12], nonce)
-				})
-				t.pendingPings[nonce] = &pendingPing{ch: pongCh, timer: timer}
-				t.pingMu.Unlock()
-
-				payload, _ := json.Marshal(map[string]string{"nonce": nonce})
-				err := t.SendMessage(ctx, peerID, "ping", payload)
-				if err != nil {
-					log.Printf("⚠️ Ping to %s failed: %v", peerID[:12], err)
-					t.pingMu.Lock()
-					if pp, ok := t.pendingPings[nonce]; ok {
-						pp.timer.Stop()
-						delete(t.pendingPings, nonce)
-					}
-					t.pingMu.Unlock()
-					continue
-				}
-
-				select {
-				case <-pongCh:
-					// success
-				case <-time.After(t.pingTimeout):
-					// already handled by timer
-				}
-			}
-		}
-	}()
+	} else {
+		// Receiver: monitor incoming ping silence
+		ctx, cancel := context.WithCancel(context.Background())
+		t.keepAliveCancel[peerID] = cancel
+		t.kaMu.Unlock()
+		go t.monitorPingReceive(ctx, peerID)
+	}
 }
 
 func (t *RelayTransport) HandlePong(nonce string) {
@@ -876,6 +907,54 @@ func (t *RelayTransport) stopKeepAlive(peerID string) {
 	if cancel, exists := t.keepAliveCancel[peerID]; exists {
 		cancel()
 		delete(t.keepAliveCancel, peerID)
+	}
+}
+
+func (t *RelayTransport) monitorPingReceive(ctx context.Context, peerID string) {
+	ticker := time.NewTicker(t.keepAliveInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			// Transport is shutting down or peer was explicitly stopped
+			return
+		case <-ticker.C:
+			t.lastPingReceivedMu.Lock()
+			last, ok := t.lastPingReceived[peerID]
+			t.lastPingReceivedMu.Unlock()
+
+			if ok && time.Since(last) > t.pingReceiveTimeout {
+				t.log("⏰ No ping from %s for %v – disconnecting", peerID[:12], time.Since(last))
+				t.DisconnectFromPeer(peerID)
+
+				t.mu.RLock()
+				for _, h := range t.peerDisconnectedHandlers {
+					h(peerID)
+				}
+				t.mu.RUnlock()
+
+				// Clean up
+				t.lastPingReceivedMu.Lock()
+				delete(t.lastPingReceived, peerID)
+				t.lastPingReceivedMu.Unlock()
+				return
+			}
+
+			// Also detect if the peer disconnected gracefully via libp2p
+			if !t.IsPeerConnected(peerID) {
+				t.log("👋 Peer %s no longer connected", peerID[:12])
+				t.mu.RLock()
+				for _, h := range t.peerDisconnectedHandlers {
+					h(peerID)
+				}
+				t.mu.RUnlock()
+
+				t.lastPingReceivedMu.Lock()
+				delete(t.lastPingReceived, peerID)
+				t.lastPingReceivedMu.Unlock()
+				return
+			}
+		}
 	}
 }
 
