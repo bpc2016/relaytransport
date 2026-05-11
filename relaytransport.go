@@ -942,7 +942,7 @@ func (t *RelayTransport) monitorPingReceive(ctx context.Context, peerID string) 
 
 			// Also detect if the peer disconnected gracefully via libp2p
 			if !t.IsPeerConnected(peerID) {
-				t.log("👋 Peer %s no longer connected", peerID[:12])
+				t.log("👋 Peer %s No longer connected", peerID[:12])
 				t.mu.RLock()
 				for _, h := range t.peerDisconnectedHandlers {
 					h(peerID)
