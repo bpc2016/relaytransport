@@ -117,6 +117,10 @@ type RelayTransport struct {
 	blacklist   map[string]time.Time // peerID -> expire time
 	blacklistMu sync.Mutex
 	cancelFunc  context.CancelFunc // see Start()
+
+	// disconnection notification
+	disconnected chan struct{} // closed when relay connection is lost v0.3.0
+	discMu       sync.Mutex
 }
 
 type pendingPing struct {
@@ -199,6 +203,8 @@ func NewRelayTransport(cfg Config) (*RelayTransport, error) {
 	t.host.SetStreamHandler(protocol.ID(t.identifyProtocolID), t.handleIdentifyStream)
 	t.host.SetStreamHandler(protocol.ID(t.messageProtocolID), t.handleStream)
 
+	// init disconnect channel
+	t.disconnected = make(chan struct{})
 	return t, nil
 }
 
@@ -226,10 +232,16 @@ func (t *RelayTransport) Start(ctx context.Context) error {
 	t.log("%s\n", "🔌 Added self circuit address")
 
 	// 5. Register with relay (custom discovery protocol)
+	var registered bool
 	if err := t.registerWithRelay(ctx); err != nil {
 		fmt.Printf("⚠️ Relay registration failed: %v\n", err)
 	} else {
-		t.log("%s\n", "📝 Relay registration acknowledged")
+		t.log("📝 Relay registration acknowledged")
+		registered = true
+	}
+
+	// Only start discovery if registration succeeded (optional improvement)
+	if registered {
 		go t.discoverOnce(ctx)
 	}
 
@@ -237,11 +249,20 @@ func (t *RelayTransport) Start(ctx context.Context) error {
 	go t.renewReservationLoop(ctx)
 	go t.discoverPeersLoop(ctx)
 
+	// 7. Watch relay disconnection
+	go t.watchRelayDisconnection(ctx)
 	return nil
 }
 
 // Stop deregisters from the relay and closes the host.
 func (t *RelayTransport) Stop() error {
+	t.discMu.Lock()
+	if t.disconnected != nil {
+		close(t.disconnected)
+		t.disconnected = nil
+	}
+	t.discMu.Unlock()
+
 	if t.cancelFunc != nil {
 		t.cancelFunc() // this stops discoverPeersLoop, renewReservationLoop, etc.
 	}
@@ -251,8 +272,9 @@ func (t *RelayTransport) Stop() error {
 	if err := t.deregisterFromRelay(ctx); err != nil {
 		fmt.Printf("⚠️ Failed to deregister from relay: %v\n", err)
 	}
+	// IMPORTANT: Do NOT close the host. The host is managed by the caller.
 	fmt.Printf("%s\n", "👋 Bye!")
-	return t.host.Close()
+	return nil // v0.3.0 was t.host.Close()
 }
 
 // SendMessage sends a JSON‑encoded message to a peer using the message protocol.
@@ -480,15 +502,14 @@ func (t *RelayTransport) handleDiscoveredPeers(peerIDs []string) {
 
 func (t *RelayTransport) connectAndIdentify(ctx context.Context, pi peer.AddrInfo) error {
 	if err := t.host.Connect(ctx, pi); err != nil {
-		// Check for NO_RESERVATION error (string match)
+		// Check for NO_RESERVATION – this is transient, do not blacklist
 		if strings.Contains(err.Error(), "NO_RESERVATION") {
-			t.blacklistMu.Lock()
-			t.blacklist[pi.ID.String()] = time.Now().Add(t.blacklistInterval)
-			t.blacklistMu.Unlock()
-			t.log("⚠️ Blacklisting %s due to NO_RESERVATION", pi.ID.String()[:12])
+			t.log("ℹ️ Peer %s has no relay reservation – will retry later", pi.ID.String()[:12])
+			return fmt.Errorf("no reservation: %w", err)
 		}
 		return fmt.Errorf("connect failed: %w", err)
 	}
+
 	username, err := t.exchangeIdentification(ctx, pi.ID.String())
 	if err != nil {
 		t.host.Network().ClosePeer(pi.ID)
@@ -498,9 +519,15 @@ func (t *RelayTransport) connectAndIdentify(ctx context.Context, pi peer.AddrInf
 	if len(pi.Addrs) > 0 {
 		address = pi.Addrs[0].String()
 	}
+
+	// After successful identification and registration, clear any stale blacklist
 	if err := t.peerRegistry.RegisterPeer(pi.ID.String(), username, address); err != nil {
 		log.Printf("⚠️ Failed to register peer %s: %v", pi.ID.String()[:12], err)
 	}
+	t.blacklistMu.Lock()
+	delete(t.blacklist, pi.ID.String())
+	t.blacklistMu.Unlock()
+
 	t.startKeepAlive(pi.ID.String())
 
 	t.mu.RLock()
@@ -889,6 +916,32 @@ func (t *RelayTransport) renewReservation(ctx context.Context) {
 func (t *RelayTransport) log(format string, args ...interface{}) {
 	if t.verbose {
 		log.Printf(format, args...)
+	}
+}
+
+// 05.11 v0.3.0
+func (t *RelayTransport) Disconnected() <-chan struct{} {
+	return t.disconnected
+}
+
+func (t *RelayTransport) watchRelayDisconnection(ctx context.Context) {
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if t.host.Network().Connectedness(t.relayInfo.ID) != network.Connected {
+				t.discMu.Lock()
+				if t.disconnected != nil {
+					close(t.disconnected)
+					t.disconnected = nil
+				}
+				t.discMu.Unlock()
+				return
+			}
+		}
 	}
 }
 
