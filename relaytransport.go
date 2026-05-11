@@ -545,7 +545,7 @@ func (t *RelayTransport) exchangeIdentification(ctx context.Context, peerID stri
 	ctx = network.WithAllowLimitedConn(ctx, "identify")
 	pid, err := peer.Decode(peerID)
 	if err != nil {
-		return "", fmt.Errorf("invalid peer ID: %w", err)
+		return "", fmt.Errorf("Invalid peer ID: %w", err)
 	}
 	s, err := t.host.NewStream(ctx, pid, protocol.ID(t.identifyProtocolID))
 	if err != nil {
