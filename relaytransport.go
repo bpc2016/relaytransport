@@ -1,6 +1,3 @@
-// Package relaytransport implements a libp2p transport that uses a relay server
-// for peer discovery and connection. It supports automatic relay reservation,
-// peer identification exchange, keep‑alive ping‑pong, and message routing.
 package relaytransport
 
 import (
@@ -24,59 +21,48 @@ import (
 	"github.com/multiformats/go-multiaddr"
 )
 
-// PeerRegistry stores and retrieves peer information.
 type PeerRegistry interface {
-	// RegisterPeer stores a peer's username and address.
 	RegisterPeer(peerID, username, address string) error
-	// UsernameByPeerID returns the username for a given peer ID.
 	UsernameByPeerID(peerID string) (string, bool)
-	// GetKnownPeers returns all known peers (peerID → username).
 	GetKnownPeers() map[string]string
-	// MergeKnownPeers merges a map of peer IDs to usernames.
 	MergeKnownPeers(peers map[string]string) error
 }
 
-// RelayDiscovery defines the interface for interacting with the relay server.
 type RelayDiscovery interface {
-	// Register sends a registration request to the relay.
 	Register(ctx context.Context, host host.Host, relayID peer.ID, myPeerID string) error
-	// Deregister sends a deregistration request.
 	Deregister(ctx context.Context, host host.Host, relayID peer.ID, myPeerID string) error
-	// GetPeerList requests the list of currently registered peers from the relay.
 	GetPeerList(ctx context.Context, host host.Host, relayID peer.ID) ([]string, error)
 }
 
-// Config holds the configuration for a RelayTransport.
 type Config struct {
 	Host           host.Host
 	RelayAddr      multiaddr.Multiaddr
-	PrivKey        crypto.PrivKey // optional, not used internally
+	PrivKey        crypto.PrivKey
 	Username       string
 	PeerRegistry   PeerRegistry
 	RelayDiscovery RelayDiscovery
-	IsServer       bool   // v0.1.5
-	Group          string // v0.1.5
-	Verbose        bool   // if true, print informational logs
+	IsServer       bool
+	Group          string
+	Verbose        bool
 
 	MessageProtocolID  string
 	IdentifyProtocolID string
 
 	KeepAliveInterval        time.Duration
 	PingTimeout              time.Duration
-	PingReceiveTimeout       time.Duration // if non‑sender, disconnect when silent for this long
+	PingReceiveTimeout       time.Duration
 	ReservationRenewInterval time.Duration
 	DiscoveryInterval        time.Duration
-	BlacklistDuration        time.Duration // v0.1.8
+	BlacklistDuration        time.Duration
 }
 
-// RelayTransport is a libp2p transport that uses a relay for peer discovery.
 type RelayTransport struct {
 	host         host.Host
 	username     string
 	peerID       string
-	verbose      bool   // v0.1.3
-	isServer     bool   // v0.1.5
-	group        string // v0.1.5
+	verbose      bool
+	isServer     bool
+	group        string
 	relayAddr    multiaddr.Multiaddr
 	relayInfo    *peer.AddrInfo
 	observedAddr multiaddr.Multiaddr
@@ -85,18 +71,15 @@ type RelayTransport struct {
 	peerRegistry   PeerRegistry
 	relayDiscovery RelayDiscovery
 
-	// Protocol IDs (converted to protocol.ID when used)
 	identifyProtocolID string
 	messageProtocolID  string
 
-	// Handlers
 	peerConnectedHandlers    []func(string)
 	peerDisconnectedHandlers []func(string)
 	messageReceivedHandlers  []func(string, string, []byte)
 	messageHandler           func(string, string, []byte)
 	mu                       sync.RWMutex
 
-	// Keep-alive / ping-pong
 	keepAliveCancel    map[string]context.CancelFunc
 	kaMu               sync.Mutex
 	pendingPings       map[string]*pendingPing
@@ -105,25 +88,21 @@ type RelayTransport struct {
 	lastPingReceivedMu sync.Mutex
 	pingReceiveTimeout time.Duration
 
-	// Reservation
 	reservationExpiry time.Time
 	renewalTimer      *time.Timer
 	renewalMu         sync.Mutex
 
-	// Intervals
 	keepAliveInterval        time.Duration
 	pingTimeout              time.Duration
 	reservationRenewInterval time.Duration
 	discoveryInterval        time.Duration
 	blacklistInterval        time.Duration
 
-	// Blacklist
-	blacklist   map[string]time.Time // peerID -> expire time
+	blacklist   map[string]time.Time
 	blacklistMu sync.Mutex
-	cancelFunc  context.CancelFunc // see Start()
+	cancelFunc  context.CancelFunc
 
-	// disconnection notification
-	disconnected chan struct{} // closed when relay connection is lost v0.3.0
+	disconnected chan struct{}
 	discMu       sync.Mutex
 }
 
@@ -135,7 +114,6 @@ type PeerRoleSetter interface {
 	SetPeerRole(peerID string, isServer bool)
 }
 
-// NewRelayTransport creates a new RelayTransport with the given configuration.
 func NewRelayTransport(cfg Config) (*RelayTransport, error) {
 	if cfg.Host == nil {
 		return nil, errors.New("host is required")
@@ -206,28 +184,23 @@ func NewRelayTransport(cfg Config) (*RelayTransport, error) {
 		blacklistInterval:        cfg.BlacklistDuration,
 	}
 
-	// Set stream handlers (convert string to protocol.ID)
 	t.host.SetStreamHandler(protocol.ID(t.identifyProtocolID), t.handleIdentifyStream)
 	t.host.SetStreamHandler(protocol.ID(t.messageProtocolID), t.handleStream)
 	t.pingReceiveTimeout = cfg.PingReceiveTimeout
 	t.lastPingReceived = make(map[string]time.Time)
 
-	// init disconnect channel
 	t.disconnected = make(chan struct{})
 	return t, nil
 }
 
-// Start connects to the relay, reserves a slot, and starts background tasks.
 func (t *RelayTransport) Start(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	t.cancelFunc = cancel
-	// 1. Connect to relay
 	if err := t.host.Connect(ctx, *t.relayInfo); err != nil {
 		return fmt.Errorf("connect to relay: %w", err)
 	}
 	t.log("%s\n", "✅ Connected to relay")
 
-	// 2. Reserve a slot on the relay
 	resv, err := client.Reserve(ctx, t.host, *t.relayInfo)
 	if err != nil {
 		return fmt.Errorf("relay reservation failed: %w", err)
@@ -235,12 +208,10 @@ func (t *RelayTransport) Start(ctx context.Context) error {
 	t.log("📅 Relay reservation made, expires: %s\n", resv.Expiration.Format("15:04:05"))
 	t.setReservationExpiry(resv.Expiration)
 
-	// 4. Add circuit address for self
 	circuitAddr, _ := multiaddr.NewMultiaddr(fmt.Sprintf("%s/p2p-circuit", t.relayAddr.String()))
 	t.host.Peerstore().AddAddr(t.host.ID(), circuitAddr, peerstore.PermanentAddrTTL)
 	t.log("%s\n", "🔌 Added self circuit address")
 
-	// 5. Register with relay (custom discovery protocol)
 	var registered bool
 	if err := t.registerWithRelay(ctx); err != nil {
 		fmt.Printf("⚠️ Relay registration failed: %v\n", err)
@@ -248,22 +219,15 @@ func (t *RelayTransport) Start(ctx context.Context) error {
 		t.log("📝 Relay registration acknowledged")
 		registered = true
 	}
-
-	// Only start discovery if registration succeeded (optional improvement)
 	if registered {
 		go t.discoverOnce(ctx)
 	}
-
-	// 6. Start background tasks
 	go t.renewReservationLoop(ctx)
 	go t.discoverPeersLoop(ctx)
-
-	// 7. Watch relay disconnection
 	go t.watchRelayDisconnection(ctx)
 	return nil
 }
 
-// Stop deregisters from the relay and closes the host.
 func (t *RelayTransport) Stop() error {
 	t.discMu.Lock()
 	if t.disconnected != nil {
@@ -273,7 +237,7 @@ func (t *RelayTransport) Stop() error {
 	t.discMu.Unlock()
 
 	if t.cancelFunc != nil {
-		t.cancelFunc() // this stops discoverPeersLoop, renewReservationLoop, etc.
+		t.cancelFunc()
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -281,12 +245,10 @@ func (t *RelayTransport) Stop() error {
 	if err := t.deregisterFromRelay(ctx); err != nil {
 		fmt.Printf("⚠️ Failed to deregister from relay: %v\n", err)
 	}
-	// IMPORTANT: Do NOT close the host. The host is managed by the caller.
 	fmt.Printf("%s\n", "👋 Bye!")
-	return nil // v0.3.0 was t.host.Close()
+	return nil
 }
 
-// SendMessage sends a JSON‑encoded message to a peer using the message protocol.
 func (t *RelayTransport) SendMessage(ctx context.Context, toPeerID, msgType string, payload []byte) error {
 	pid, err := peer.Decode(toPeerID)
 	if err != nil {
@@ -312,33 +274,28 @@ func (t *RelayTransport) SendMessage(ctx context.Context, toPeerID, msgType stri
 	return nil
 }
 
-// SetMessageHandler sets a single handler for all incoming messages.
 func (t *RelayTransport) SetMessageHandler(handler func(fromPeerID string, msgType string, payload []byte)) {
 	t.messageHandler = handler
 }
 
-// OnPeerConnected adds a handler that is called when a peer connects.
 func (t *RelayTransport) OnPeerConnected(handler func(string)) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.peerConnectedHandlers = append(t.peerConnectedHandlers, handler)
 }
 
-// OnPeerDisconnected adds a handler that is called when a peer disconnects.
 func (t *RelayTransport) OnPeerDisconnected(handler func(string)) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.peerDisconnectedHandlers = append(t.peerDisconnectedHandlers, handler)
 }
 
-// OnMessageReceived adds a handler that is called when a message is received.
 func (t *RelayTransport) OnMessageReceived(handler func(string, string, []byte)) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.messageReceivedHandlers = append(t.messageReceivedHandlers, handler)
 }
 
-// GetConnectedPeers returns information about currently connected peers.
 func (t *RelayTransport) GetConnectedPeers() []PeerInfo {
 	conns := t.host.Network().Conns()
 	peerMap := make(map[string]PeerInfo)
@@ -347,7 +304,7 @@ func (t *RelayTransport) GetConnectedPeers() []PeerInfo {
 	for _, conn := range conns {
 		pid := conn.RemotePeer().String()
 		if pid == relayID {
-			continue // skip relay
+			continue
 		}
 		if _, exists := peerMap[pid]; exists {
 			continue
@@ -367,7 +324,6 @@ func (t *RelayTransport) GetConnectedPeers() []PeerInfo {
 	return peers
 }
 
-// IsPeerConnected checks if a peer is currently connected.
 func (t *RelayTransport) IsPeerConnected(peerID string) bool {
 	pid, err := peer.Decode(peerID)
 	if err != nil {
@@ -376,7 +332,6 @@ func (t *RelayTransport) IsPeerConnected(peerID string) bool {
 	return len(t.host.Network().ConnsToPeer(pid)) > 0
 }
 
-// DisconnectFromPeer closes all connections to the given peer.
 func (t *RelayTransport) DisconnectFromPeer(peerID string) error {
 	t.stopKeepAlive(peerID)
 	pid, err := peer.Decode(peerID)
@@ -386,17 +341,13 @@ func (t *RelayTransport) DisconnectFromPeer(peerID string) error {
 	return t.host.Network().ClosePeer(pid)
 }
 
-// GetPeerID returns the local peer ID.
 func (t *RelayTransport) GetPeerID() string {
 	return t.peerID
 }
 
-// GetUsername returns the local username.
 func (t *RelayTransport) GetUsername() string {
 	return t.username
 }
-
-// -------------------- Internal methods --------------------
 
 func (t *RelayTransport) registerWithRelay(ctx context.Context) error {
 	return t.relayDiscovery.Register(ctx, t.host, t.relayInfo.ID, t.peerID)
@@ -432,7 +383,6 @@ func (t *RelayTransport) renewReservationLoop(ctx context.Context) {
 func (t *RelayTransport) discoverPeersLoop(ctx context.Context) {
 	ticker := time.NewTicker(t.discoveryInterval)
 	defer ticker.Stop()
-
 	for {
 		select {
 		case <-ctx.Done():
@@ -440,7 +390,6 @@ func (t *RelayTransport) discoverPeersLoop(ctx context.Context) {
 		case <-ticker.C:
 			peerIDs, err := t.requestPeerList(ctx)
 			if err != nil {
-				// Don't log if the context is cancelled (shutting down)
 				if ctx.Err() != nil {
 					return
 				}
@@ -474,7 +423,6 @@ func (t *RelayTransport) handleDiscoveredPeers(peerIDs []string) {
 			continue
 		}
 
-		// Skip blacklisted peers
 		t.blacklistMu.Lock()
 		expire, ok := t.blacklist[pid.String()]
 		if ok && time.Now().Before(expire) {
@@ -511,7 +459,6 @@ func (t *RelayTransport) handleDiscoveredPeers(peerIDs []string) {
 
 func (t *RelayTransport) connectAndIdentify(ctx context.Context, pi peer.AddrInfo) error {
 	if err := t.host.Connect(ctx, pi); err != nil {
-		// Check for NO_RESERVATION – this is transient, do not blacklist
 		if strings.Contains(err.Error(), "NO_RESERVATION") {
 			t.log("ℹ️ Peer %s has no relay reservation – will retry later", pi.ID.String()[:12])
 			return fmt.Errorf("no reservation: %w", err)
@@ -529,7 +476,6 @@ func (t *RelayTransport) connectAndIdentify(ctx context.Context, pi peer.AddrInf
 		address = pi.Addrs[0].String()
 	}
 
-	// After successful identification and registration, clear any stale blacklist
 	if err := t.peerRegistry.RegisterPeer(pi.ID.String(), username, address); err != nil {
 		log.Printf("⚠️ Failed to register peer %s: %v", pi.ID.String()[:12], err)
 	}
@@ -562,7 +508,6 @@ func (t *RelayTransport) exchangeIdentification(ctx context.Context, peerID stri
 	}
 	defer s.Close()
 
-	// Send our info
 	req := struct {
 		Username   string            `json:"username"`
 		PeerID     string            `json:"peer_id"`
@@ -580,7 +525,6 @@ func (t *RelayTransport) exchangeIdentification(ctx context.Context, peerID stri
 		return "", fmt.Errorf("send identify: %w", err)
 	}
 
-	// Read response
 	s.SetReadDeadline(time.Now().Add(3 * time.Second))
 	var resp struct {
 		Username   string            `json:"username"`
@@ -607,7 +551,6 @@ func (t *RelayTransport) exchangeIdentification(ctx context.Context, peerID stri
 	if resp.Username == "" {
 		return "", fmt.Errorf("received empty username")
 	}
-	// If local group is non‑empty and doesn't match remote group, reject
 	if t.group != "" && resp.Group != t.group {
 		t.blacklistMu.Lock()
 		t.blacklist[peerID] = time.Now().Add(t.blacklistInterval)
@@ -615,12 +558,10 @@ func (t *RelayTransport) exchangeIdentification(ctx context.Context, peerID stri
 		t.log("⚠️ Blacklisting %s due to group mismatch (expires %v)", peerID[:12], time.Now().Add(t.blacklistInterval))
 		return "", fmt.Errorf("group mismatch: expected %s, got %s", t.group, resp.Group)
 	}
-	// Reject client‑client connections
 	if !t.isServer && !resp.IsServer {
 		return "", fmt.Errorf("client-client connection not allowed")
 	}
 
-	// Register the peer
 	remoteAddr := s.Conn().RemoteMultiaddr().String()
 	if err := t.peerRegistry.RegisterPeer(peerID, resp.Username, remoteAddr); err != nil {
 		log.Printf("⚠️ Failed to register peer %s: %v", peerID[:12], err)
@@ -663,7 +604,6 @@ func (t *RelayTransport) handleIdentifyStream(s network.Stream) {
 		fmt.Printf("⚠️ Empty username from %s\n", remotePeerID[:12])
 		return
 	}
-	// If local group is non‑empty and doesn't match remote group, reject
 	if t.group != "" && incomingMsg.Group != t.group {
 		t.blacklistMu.Lock()
 		t.blacklist[remotePeerID] = time.Now().Add(t.blacklistInterval)
@@ -671,7 +611,6 @@ func (t *RelayTransport) handleIdentifyStream(s network.Stream) {
 		t.log("⚠️ Blacklisting %s due to group mismatch (expires %v)", remotePeerID[:12], time.Now().Add(t.blacklistInterval))
 		return
 	}
-	// Reject client‑client connections
 	if !t.isServer && !incomingMsg.IsServer {
 		fmt.Printf("❌ Rejecting client-client connection from %s\n", remotePeerID[:12])
 		return
@@ -698,19 +637,15 @@ func (t *RelayTransport) handleIdentifyStream(s network.Stream) {
 		return
 	}
 
-	// Store in peer manager
 	address := s.Conn().RemoteMultiaddr().String()
 	if err := t.peerRegistry.RegisterPeer(remotePeerID, incomingMsg.Username, address); err != nil {
 		log.Printf("⚠️ Failed to register peer %s: %v", remotePeerID[:12], err)
 	}
 
-	// If the registry supports role storage, store the IsServer flag
 	if setter, ok := t.peerRegistry.(PeerRoleSetter); ok {
 		setter.SetPeerRole(remotePeerID, incomingMsg.IsServer)
 	}
 
-	// symmetrical recognition
-	// Call peer connected handlers (symmetrical to client side)
 	t.mu.RLock()
 	handlers := t.peerConnectedHandlers
 	t.mu.RUnlock()
@@ -743,7 +678,6 @@ func (t *RelayTransport) handleStream(s network.Stream) {
 	}
 	payload := msg["payload"]
 
-	// Handle ping/pong internally
 	switch msgType {
 	case "ping":
 		var pingData struct{ Nonce string }
@@ -751,12 +685,12 @@ func (t *RelayTransport) handleStream(s network.Stream) {
 			fmt.Printf("❌ Failed to parse ping: %v\n", err)
 			return
 		}
+		// DEBUG: record the ping
+		log.Printf("[DBG] received ping from %s at %v", remotePeerID[:12], time.Now().Format("15:04:05"))
 		t.lastPingReceivedMu.Lock()
 		t.lastPingReceived[remotePeerID] = time.Now()
 		t.lastPingReceivedMu.Unlock()
-		// Send pong as a new message (not on the same stream)
 		pongPayload, _ := json.Marshal(map[string]string{"nonce": pingData.Nonce})
-		// Use background context – the pong is independent of the incoming stream
 		if err := t.SendMessage(context.Background(), remotePeerID, "pong", pongPayload); err != nil {
 			fmt.Printf("⚠️ Failed to send pong: %v\n", err)
 		} else {
@@ -775,7 +709,6 @@ func (t *RelayTransport) handleStream(s network.Stream) {
 		return
 	}
 
-	// Forward other messages
 	t.mu.RLock()
 	handlers := t.messageReceivedHandlers
 	t.mu.RUnlock()
@@ -798,7 +731,6 @@ func (t *RelayTransport) startKeepAlive(peerID string) {
 	}
 
 	if t.shouldSendKeepAlive(peerID) {
-		// Sender: send pings regularly
 		ctx, cancel := context.WithCancel(context.Background())
 		t.keepAliveCancel[peerID] = cancel
 		t.kaMu.Unlock()
@@ -823,6 +755,7 @@ func (t *RelayTransport) startKeepAlive(peerID string) {
 				case <-ticker.C:
 					if !t.IsPeerConnected(peerID) {
 						t.log("👋 Peer %s disconnected, stopping ping-pong", peerID[:12])
+						log.Printf("[DBG] sender: peer %s no longer connected – firing handlers", peerID[:12])
 						t.mu.RLock()
 						for _, h := range t.peerDisconnectedHandlers {
 							h(peerID)
@@ -844,8 +777,7 @@ func (t *RelayTransport) startKeepAlive(peerID string) {
 						delete(t.pendingPings, nonce)
 						t.pingMu.Unlock()
 						log.Printf("⚠️ Ping timeout for %s (nonce %s)", peerID[:12], nonce)
-
-						// Force disconnect and notify application
+						log.Printf("[DBG] sender timeout – disconnecting %s", peerID[:12])
 						t.DisconnectFromPeer(peerID)
 						t.mu.RLock()
 						for _, h := range t.peerDisconnectedHandlers {
@@ -871,18 +803,16 @@ func (t *RelayTransport) startKeepAlive(peerID string) {
 
 					select {
 					case <-pongCh:
-						// success
 					case <-time.After(t.pingTimeout):
-						// already handled by timer
 					}
 				}
 			}
 		}()
 	} else {
-		// Receiver: monitor incoming ping silence
 		ctx, cancel := context.WithCancel(context.Background())
 		t.keepAliveCancel[peerID] = cancel
 		t.kaMu.Unlock()
+		log.Printf("[DBG] receiver: starting monitor for %s", peerID[:12])
 		go t.monitorPingReceive(ctx, peerID)
 	}
 }
@@ -916,15 +846,17 @@ func (t *RelayTransport) monitorPingReceive(ctx context.Context, peerID string) 
 	for {
 		select {
 		case <-ctx.Done():
-			// Transport is shutting down or peer was explicitly stopped
 			return
 		case <-ticker.C:
 			t.lastPingReceivedMu.Lock()
 			last, ok := t.lastPingReceived[peerID]
 			t.lastPingReceivedMu.Unlock()
+			age := time.Since(last)
+			log.Printf("[DBG] monitor tick for %s: ok=%v, last ping %v ago", peerID[:12], ok, age.Round(time.Second))
 
-			if ok && time.Since(last) > t.pingReceiveTimeout {
-				t.log("⏰ No ping from %s for %v – disconnecting", peerID[:12], time.Since(last))
+			if ok && age > t.pingReceiveTimeout {
+				log.Printf("[DBG] receiver timeout for %s – disconnecting and firing handlers", peerID[:12])
+				t.log("⏰ No ping from %s for %v – disconnecting", peerID[:12], age)
 				t.DisconnectFromPeer(peerID)
 
 				t.mu.RLock()
@@ -933,15 +865,14 @@ func (t *RelayTransport) monitorPingReceive(ctx context.Context, peerID string) 
 				}
 				t.mu.RUnlock()
 
-				// Clean up
 				t.lastPingReceivedMu.Lock()
 				delete(t.lastPingReceived, peerID)
 				t.lastPingReceivedMu.Unlock()
 				return
 			}
 
-			// Also detect if the peer disconnected gracefully via libp2p
 			if !t.IsPeerConnected(peerID) {
+				log.Printf("[DBG] receiver: peer %s no longer connected – firing handlers", peerID[:12])
 				t.log("👋 Peer %s No longer connected", peerID[:12])
 				t.mu.RLock()
 				for _, h := range t.peerDisconnectedHandlers {
@@ -998,7 +929,6 @@ func (t *RelayTransport) log(format string, args ...interface{}) {
 	}
 }
 
-// 05.11 v0.3.0
 func (t *RelayTransport) Disconnected() <-chan struct{} {
 	return t.disconnected
 }
@@ -1024,15 +954,12 @@ func (t *RelayTransport) watchRelayDisconnection(ctx context.Context) {
 	}
 }
 
-// -------------------- DefaultRelayDiscovery --------------------
+// ------------- DefaultRelayDiscovery ------------
 
-// DefaultRelayDiscovery implements the RelayDiscovery interface using the
-// original /bpc/discovery/1.0.0 JSON protocol.
 type DefaultRelayDiscovery struct {
 	ProtocolID string
 }
 
-// NewDefaultRelayDiscovery returns a DefaultRelayDiscovery with the default protocol ID.
 func NewDefaultRelayDiscovery() *DefaultRelayDiscovery {
 	return &DefaultRelayDiscovery{ProtocolID: "/bpc/discovery/1.0.0"}
 }
@@ -1078,7 +1005,6 @@ func (d *DefaultRelayDiscovery) Register(ctx context.Context, host host.Host, re
 		return err
 	}
 	s.CloseWrite()
-	// ignore ack
 	var ack json.RawMessage
 	_ = json.NewDecoder(s).Decode(&ack)
 	return nil
@@ -1136,9 +1062,8 @@ func (d *DefaultRelayDiscovery) GetPeerList(ctx context.Context, host host.Host,
 	return resp.Payload, nil
 }
 
-// -------------------- PeerInfo --------------------
+// ------------- PeerInfo ------------
 
-// PeerInfo contains basic information about a connected peer.
 type PeerInfo struct {
 	ID       string
 	Username string
